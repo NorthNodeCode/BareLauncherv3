@@ -3,6 +3,8 @@ package com.bare.launcher;
 import android.content.ComponentName;
 import android.content.pm.ResolveInfo;
 
+import java.util.Map;
+
 /**
  * Record describing one launchable app on the home shelf.
  *
@@ -16,7 +18,9 @@ import android.content.pm.ResolveInfo;
  *   <li>{@link #packageName} — keys for icon caches, the keymap
  *       SparseArray, the hidden-apps ArraySet, and the app-list
  *       persisted-order map.</li>
- *   <li>{@link #label} — drawn directly under each cell's icon.</li>
+ *   <li>{@link #label} — drawn directly under each cell's icon. This is
+ *       the label the user SEES: the app's own name, or their rename
+ *       (v2.3.0). {@link #systemLabel} keeps the app's own name.</li>
  *   <li>{@link #component} — fast-path launch via
  *       {@code Intent.setComponent} (skips PackageManager resolution
  *       binder hops; saves 50-200 ms per launch on slow ROMs).</li>
@@ -38,6 +42,20 @@ import android.content.pm.ResolveInfo;
 final class AppInfo {
     final String        packageName;
     final String        label;
+    /**
+     * The label the platform reports (PackageManager / TV Input Framework),
+     * before any user rename. Equal to {@link #label} unless the user renamed
+     * the app. It is what {@link AppListCache} persists, so the cache stays a
+     * pure mirror of the system and a rename (or its reset) never needs a
+     * cache rewrite — the override is re-applied wherever an AppInfo is
+     * built (see {@link #withRename}).
+     *
+     * <p>{@link #label} stays {@code final} on purpose: it is read on worker
+     * threads (the TV-input tile draws it, the cache writer snapshots it), so
+     * a rename publishes a NEW instance via {@link #withLabel} instead of
+     * mutating a shared one — no volatile read added to the bind hot path.
+     */
+    final String        systemLabel;
     final ComponentName component;
     /**
      * The platform {@link ResolveInfo} for this app, when known.
@@ -104,15 +122,36 @@ final class AppInfo {
     final String tvInputId;
 
     AppInfo(String pkg, String lbl, ComponentName cmp, ResolveInfo r) {
-        this(pkg, lbl, cmp, r, null);
+        this(pkg, lbl, lbl, cmp, r, null);
     }
 
-    private AppInfo(String pkg, String lbl, ComponentName cmp, ResolveInfo r, String tvInput) {
+    private AppInfo(String pkg, String lbl, String sysLbl, ComponentName cmp,
+                    ResolveInfo r, String tvInput) {
         packageName = pkg;
         label       = lbl;
+        systemLabel = sysLbl;
         component   = cmp;
         ri          = r;
         tvInputId   = tvInput;
+    }
+
+    /** Copy of this entry showing {@code shown} as its label. Identity
+     *  ({@link #packageName}, {@link #component}, {@link #tvInputId}), the
+     *  resolved {@link #ri} and {@link #systemLabel} carry over; the
+     *  {@link #displayLabel} memo starts empty so the new text is measured
+     *  on the next bind. */
+    AppInfo withLabel(String shown) {
+        return new AppInfo(packageName, shown, systemLabel, component, ri, tvInputId);
+    }
+
+    /** This entry with the user's rename from {@code renames} applied (or
+     *  removed, when there is none). Returns {@code this} — no allocation —
+     *  when the shown label is already right, which is every app on every
+     *  call for a user who never renamed anything. */
+    AppInfo withRename(Map<String, String> renames) {
+        String want = renames.get(packageName);
+        if (want == null) want = systemLabel;
+        return want.equals(label) ? this : withLabel(want);
     }
 
     /** Build a TV-input entry. The synthetic {@link #packageName}
@@ -123,6 +162,6 @@ final class AppInfo {
      *  (real package names are never of this shape) and contains no comma, so
      *  it is safe inside the comma-separated persisted order string. */
     static AppInfo tvInput(String inputId, String label) {
-        return new AppInfo("tvinput://" + inputId, label, null, null, inputId);
+        return new AppInfo("tvinput://" + inputId, label, label, null, null, inputId);
     }
 }

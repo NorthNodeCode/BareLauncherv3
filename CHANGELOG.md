@@ -5,6 +5,22 @@ All notable changes to BareLauncher land here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] — 2026-10-12
+
+### What's new
+
+- **Rename any app.** Hold OK on an app (or a TV input) and choose
+  **Rename** to give it the name you want on your home screen and in the
+  app drawer. Clear the name to go back to the app's own. Your names are
+  saved with Settings → Backup & restore.
+- **Change an app's icon.** Hold OK on an app and choose **Change icon**
+  to use any picture on your TV or a USB stick as its tile. Wide pictures
+  fill the tile; square logos sit neatly in the middle of it. **Reset
+  icon** brings the app's own tile back. The picture is copied into the
+  launcher, so it keeps working even if you delete the original or unplug
+  the stick. (Custom pictures aren't part of the settings backup — only
+  the names are.)
+
 ## [2.2.0] — 2026-06-26
 
 ### What's new

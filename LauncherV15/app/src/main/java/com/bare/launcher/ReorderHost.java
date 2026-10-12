@@ -2,9 +2,9 @@ package com.bare.launcher;
 
 /**
  * The surface that currently owns the shared reorder context menu (the
- * "Move / App Info / Uninstall" plate). Either the bottom home shelf
- * ({@code RecyclingShelfView}) or the pull-down app drawer
- * ({@code AppDrawer}) can be the active reorder host at any one time — never
+ * "Hide / Uninstall / App Info / Rename / Change icon / Move" plate). Either
+ * the bottom home shelf ({@code RecyclingShelfView}) or the pull-down app
+ * drawer ({@code AppDrawer}) can be the active reorder host at any one time — never
  * both, since the drawer is only reorder-able while it is open (covering the
  * shelf).
  *
@@ -17,9 +17,8 @@ package com.bare.launcher;
  */
 interface ReorderHost {
 
-    /** Current menu cursor — one of {@code MENU_HIDE} / {@code MENU_UNINSTALL}
-     *  / {@code MENU_APP_INFO} / {@code MENU_MOVE}. Read by the highlight
-     *  painter. */
+    /** Current menu cursor — one of the {@code RecyclingShelfView.MENU_*}
+     *  row ids. Read by the highlight painter. */
     int menuSelection();
 
     /** The user activated the Hide row (hides the app from the shelf/drawer;
@@ -40,4 +39,17 @@ interface ReorderHost {
      *  and App-info rows — an input is not an installed package — while
      *  keeping Move and Hide. */
     boolean menuAppIsInput();
+
+    /** The app the menu is acting on, or {@code null}. The activity uses it
+     *  to offer "Reset icon" only for an app that has a custom tile. */
+    AppInfo menuApp();
+
+    /** v2.3.0: the user activated Rename (opens the rename card). */
+    void onMenuRename();
+
+    /** v2.3.0: the user activated Change icon (opens the image picker). */
+    void onMenuChangeIcon();
+
+    /** v2.3.0: the user activated Reset icon (drops the custom tile). */
+    void onMenuResetIcon();
 }

@@ -429,8 +429,17 @@ android {
         // (pick a folder, rotate each restart or every 5–60 min; the timer
         // runs foreground-only and the instant snapshot cold-start is
         // preserved). SemVer MINOR — additive, no behaviour change when unused.
-        versionCode   = 30
-        versionName   = "2.2.0"
+        //
+        // Bumped 30 → 31: 2.3.0 adds per-app Rename and Change icon to the
+        // long-press menu. Renames are one escaped prefs string, applied where
+        // AppInfo is built (cache read + PM scan) so the bind hot path is
+        // untouched, and travel with the settings backup (new key, format
+        // version unchanged so 2.2.0 still reads 2.3.0 backups). Custom tiles
+        // are small WEBP copies in private storage, read off the UI thread
+        // only for apps that have one. SemVer MINOR — additive, no behaviour
+        // change when unused.
+        versionCode   = 31
+        versionName   = "2.3.0"
         resourceConfigurations += listOf("en")
 
         // Instrumentation test runner. Required so :app:connectedDebugAndroidTest

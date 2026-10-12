@@ -186,6 +186,42 @@ final class IconRenderer {
         return out;
     }
 
+    /** Images at least this wide (width / height) are treated as banner art
+     *  and cover the whole tile; narrower ones (square icons, logos, portrait
+     *  photos) are fitted onto the plate instead, so a picked app logo is
+     *  never cropped. 1.3 sits between 4:3 (1.33, cover) and 5:4 (1.25, fit). */
+    private static final float CUSTOM_COVER_MIN_ASPECT = 1.3f;
+
+    /** Render a user-picked image ("Change icon", v2.3.0) to a {@code w × h}
+     *  rounded tile. Draws the same neutral plate as {@link #generateBannerTile}
+     *  first, then the image with {@link #sSrcAtopPaint}: the plate's rounded
+     *  alpha is kept verbatim (no saveLayer, one bitmap) and any transparency
+     *  in the image — common in PNG logos — shows the plate rather than the
+     *  wallpaper. Banner-shaped images (see {@link #CUSTOM_COVER_MIN_ASPECT})
+     *  are centre-cropped to fill the tile; others are fitted inside the same
+     *  footprint a generated tile gives an app icon (~62% of the height).
+     *
+     *  <p>{@code src} must be a software (non-HARDWARE) bitmap; it is not
+     *  recycled here. Runs on the icon executor, once per tile decode — the
+     *  {@code new Canvas} matches every other tile path in this class. */
+    static Bitmap processCustomTile(Bitmap src, int w, int h, int corner) {
+        if (src == null || src.isRecycled() || w <= 0 || h <= 0) return null;
+        int iw = src.getWidth(), ih = src.getHeight();
+        if (iw <= 0 || ih <= 0) return null;
+        Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(out);
+        RectF rr = sRectTL.get(); rr.set(0, 0, w, h);
+        sTilePaint.setColor(0xFF2A2A30);                     // same plate as generateBannerTile
+        c.drawRoundRect(rr, corner, corner, sTilePaint);
+        float s = ((float) iw / ih >= CUSTOM_COVER_MIN_ASPECT)
+                ? Math.max((float) w / iw, (float) h / ih)       // cover
+                : Math.min(w * 0.8f / iw, h * 0.62f / ih);       // fit, icon-sized
+        float dw = iw * s, dh = ih * s;
+        rr.set((w - dw) / 2f, (h - dh) / 2f, (w + dw) / 2f, (h + dh) / 2f);
+        c.drawBitmap(src, null, rr, sSrcAtopPaint);
+        return out;
+    }
+
     /** Generate a {@code w × h} rounded-rectangle tile for a hardware TV
      *  input (HDMI / AV / …): a dark slate plate with a centred display glyph
      *  and the input's label drawn beneath it, so each input tile is

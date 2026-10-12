@@ -14,11 +14,21 @@ import java.util.Map;
  *   key_map\t183=com.a,184=com.b
  *   hidden_apps\tcom.x,com.y
  *   clock_mode\t0
+ *   app_renames\tcom.a=My app,com.b=Films\, series
  * </pre>
  * Line 1 is a magic + format-version header; every following line is a
  * {@code key\tvalue} pair. The wallpaper is deliberately NOT included — it is
  * stored as a device-scoped {@code content://} permission grant that cannot
- * be transferred to another install.
+ * be transferred to another install. Custom app tiles ("Change icon", v2.3.0)
+ * are left out for a similar reason: they are image files in private
+ * storage, and this format is a few KB of human-readable text. Renames ARE
+ * included — they are short strings in the same escaped shape as prefs (see
+ * {@link Customizations#serializeRenames}).
+ *
+ * <p>{@code app_renames} was added in v2.3.0 WITHOUT bumping {@link #VERSION}:
+ * older builds skip unknown keys, so a 2.3.0 backup still restores on 2.2.0
+ * (minus the renames). Bumping the version would make them reject the whole
+ * file instead.
  *
  * <p>Design goals mirror the rest of the launcher's persisted formats
  * ({@link AppOrder}, {@link KeymapStore}, {@code AppListCache}):
@@ -30,7 +40,8 @@ import java.util.Map;
  *   <li><b>Forward-compatible:</b> unknown keys are ignored on parse, and a
  *       newer major version is rejected rather than mis-read.</li>
  *   <li><b>Robust values:</b> the values we store (comma-separated package
- *       lists, {@code kc=pkg} maps, integers) never contain a TAB or newline;
+ *       lists, {@code kc=pkg} maps, integers, escaped rename maps) never
+ *       contain a TAB or newline;
  *       {@link #serialize} defensively strips any anyway so the line format
  *       can never be corrupted.</li>
  *   <li><b>Android-free:</b> exercised by fast JVM unit tests; the activity
@@ -51,11 +62,13 @@ final class SettingsBackup {
     static final String K_KEY_MAP    = "key_map";
     static final String K_HIDDEN     = "hidden_apps";
     static final String K_CLOCK_MODE = "clock_mode";
+    /** v2.3.0. Value is the {@link Customizations#serializeRenames} string. */
+    static final String K_RENAMES    = "app_renames";
 
     /** Build the backup file text. {@code null} string values are written as
      *  empty so every key is always present in a well-formed file. */
     static String serialize(String appOrder, int homeCount, String keyMap,
-                            String hiddenApps, int clockMode) {
+                            String hiddenApps, int clockMode, String renames) {
         StringBuilder sb = new StringBuilder(256);
         sb.append(MAGIC).append('\t').append(VERSION).append('\n');
         line(sb, K_APP_ORDER,  appOrder);
@@ -63,6 +76,7 @@ final class SettingsBackup {
         line(sb, K_KEY_MAP,    keyMap);
         line(sb, K_HIDDEN,     hiddenApps);
         line(sb, K_CLOCK_MODE, Integer.toString(clockMode));
+        line(sb, K_RENAMES,    renames);
         return sb.toString();
     }
 

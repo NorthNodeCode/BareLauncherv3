@@ -65,6 +65,7 @@ Most TV launchers are heavy, online, and crowded with promotions. BareLauncher i
 | 🗂️ **Home row + app drawer** | Favorites on the home screen, a pull-down drawer for the rest. Reorder everything freely with the D-pad. |
 | 🎛️ **Button shortcuts** | Assign remote colour/menu keys to any app directly from the home screen — no Accessibility Service required. |
 | 🗃️ **Manage apps** | Long-press any app to move, hide, open App info, or uninstall. Hidden apps stay installed, just out of sight. |
+| ✏️ **Rename & change icons** | Give any app or TV input your own name, or use any picture as its tile. Reset either one anytime. |
 | 🖼️ **Wallpaper system** | Static wallpapers, folder-based slideshows, startup wallpaper rotation, and hardware bitmap rendering that saves 8–32 MB of RAM. |
 | 🎞️ **Wallpaper slideshows** | Turn any folder of photos or wallpapers into a rotating home screen background. Supports internal storage and USB/SD media with configurable intervals (20 sec–3 min). |
 | 🌙 **Hide UI when idle** | Automatically hides the launcher interface after inactivity, leaving only the clock so your wallpapers can fill the entire screen until the screensaver starts. |

@@ -31,8 +31,12 @@ import java.util.List;
  * re-render, package set differs → full re-render with the fresh data.
  *
  * <h3>What is and isn't cached</h3>
- * Cached: package name, user-visible label, activity class name. These
- * are sufficient to:
+ * Cached: package name, the app's OWN label ({@link AppInfo#systemLabel},
+ * never a user rename), activity class name. User renames (v2.3.0) live in
+ * prefs and are re-applied by the activity to every AppInfo this cache
+ * yields, so a rename or its reset never invalidates the cache and the
+ * cache never disagrees with a fresh PM scan about what an app is called.
+ * These are sufficient to:
  * <ul>
  *   <li>Render a {@code CellView} (label + icon — icon comes from the
  *       sibling {@link IconDiskCache}).</li>
@@ -332,7 +336,7 @@ final class AppListCache {
                 : (a.component != null ? a.component.getClassName() : null);
         return new Entry() {
             @Override public String pkg()           { return a.packageName; }
-            @Override public String label()         { return a.label; }
+            @Override public String label()         { return a.systemLabel; }
             @Override public String activityClass() { return cls; }
         };
     }

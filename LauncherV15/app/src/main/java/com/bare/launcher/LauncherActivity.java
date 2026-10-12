@@ -53,6 +53,9 @@ import android.view.animation.OvershootInterpolator;
 import android.view.animation.PathInterpolator;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.OverScroller;
@@ -61,8 +64,10 @@ import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -140,11 +145,20 @@ public class LauncherActivity extends Activity {
      *  / {@link #CLOCK_OFF}. {@link #KEY_SHOW_CLOCK} is still read once for
      *  migration of pre-v1.4.9 installs. */
     private static final String KEY_CLOCK_MODE = "clock_mode";
+    /** v2.3.0: user renames, as {@link Customizations#serializeRenames}
+     *  ({@code key=label,…}, escaped). Included in the settings backup. */
+    private static final String KEY_RENAMES    = "app_renames";
+    /** v2.3.0: comma-separated keys that have a user-picked tile in
+     *  {@link CustomTiles}. Same shape as {@link #KEY_HIDDEN} (keys never
+     *  contain a comma — see {@link AppInfo#tvInput}). Not backed up: the
+     *  images themselves are not in the backup file. */
+    private static final String KEY_CUSTOM_TILES = "custom_tiles";
     private static final int    MATCH          = ViewGroup.LayoutParams.MATCH_PARENT;
     private static final int    WRAP           = ViewGroup.LayoutParams.WRAP_CONTENT;
     private static final int    REQ_PICK_WP    = 42;
     private static final int    REQ_BACKUP_EXPORT = 43;
     private static final int    REQ_BACKUP_IMPORT = 44;
+    private static final int    REQ_PICK_TILE     = 45;   // "Change icon" image picker
     private static final int    REQ_PERM_MEDIA = 71;   // runtime media-read permission
     private static final String BACKUP_FILENAME   = "barelauncher-settings.txt";
     /** Slideshow duration steps (seconds):
@@ -352,6 +366,40 @@ public class LauncherActivity extends Activity {
     /** Rows shown in the picker: each = {bucketId, displayName, count}. */
     private final java.util.List<String[]> folderPickerData = new ArrayList<>();
     private int folderPickerSel = 0;
+
+    // ── Per-app customisations (v2.3.0: Rename / Change icon) ────────────
+    /** User renames, key (package or {@code tvinput://} id) → label. An
+     *  immutable snapshot replaced wholesale (copy-on-write) on the UI thread
+     *  and read on the app executor inside {@link #queryApps}: the volatile
+     *  publish is the only synchronisation needed and a reader can never see
+     *  a half-updated map. Renames are rare, so the copy is free in practice. */
+    private volatile Map<String, String> renames = Collections.emptyMap();
+    /** Keys that have a user-picked tile in {@link #tileStore}. Same
+     *  immutable-snapshot discipline as {@link #renames}: written on the UI
+     *  thread, read by {@link #loadBannerBlocking} on the icon executor, so a
+     *  banner decode touches the disk only for apps the user customised, and
+     *  the context menu can decide whether to offer "Reset icon" without a
+     *  file stat on the UI thread. */
+    private volatile Set<String> customTilePkgs = Collections.emptySet();
+    /** File store for custom tiles. Assigned once in {@link #initCaches}
+     *  before any executor task can read it (task submission is a
+     *  happens-before edge) and never reassigned. */
+    private CustomTiles tileStore;
+    /** Key whose tile the open image picker is choosing. Lives only as long
+     *  as this activity instance: if the system kills the launcher while the
+     *  picker is open, the pick is ignored on return — nothing to clean up. */
+    private String pendingTilePkg = null;
+
+    // Rename card — lazily built on first use, like the folder picker.
+    private FrameLayout                 renameOverlay    = null;
+    private android.widget.LinearLayout renameCard       = null;
+    private EditText                    renameField      = null;
+    /** Key being renamed while the card is open, else {@code null}. */
+    private String                      renameTargetPkg  = null;
+    /** Where focus returns when the card closes: the drawer slot or the
+     *  home-row slot the renamed app occupies. */
+    private boolean                     renameFromDrawer = false;
+    private int                         renameFocusIdx   = 0;
 
     // ── Idle UI hide (slideshow-only visual cleanup) ─────────────────────
     /** Idle-hide timeout options in seconds: Off, 1 min, 2 min, 3 min, 5 min. */
@@ -593,10 +641,9 @@ public class LauncherActivity extends Activity {
      *  entry to reorder mode by whichever of the home shelf / app drawer is
      *  reordering. See {@link ReorderHost}. */
     private ReorderHost        menuHost      = null;
-    private       TextView    menuHide      = null;
-    private       TextView    menuUninstall = null;
-    private       TextView    menuAppInfo   = null;
-    private       TextView    menuMove      = null;
+    /** Context-menu rows, indexed by {@code RecyclingShelfView.MENU_*} id.
+     *  Filled by {@link #ensureMenuOverlay}; every slot is null until then. */
+    private final TextView[]  menuItems     = new TextView[RecyclingShelfView.MENU_COUNT];
     private final int[]    menuCellLoc      = new int[2];
     private final int[]    menuRootLoc      = new int[2];
     private final int[]    menuOverlayLoc   = new int[2];
@@ -1547,6 +1594,11 @@ public class LauncherActivity extends Activity {
         // shelf paints with the right filter from frame zero.
         loadKeyMap();
         loadHiddenApps();
+        // Same reason as hiddenApps: the cache pre-paint inside loadApps
+        // applies renames to the very first frame, and the first banner
+        // decodes must already know which apps have a custom tile.
+        loadRenames();
+        loadCustomTiles();
         setContentView(buildLayout());
         hideSystemUI();
         loadWallpaper();
@@ -1559,6 +1611,12 @@ public class LauncherActivity extends Activity {
             // user-visible behaviour stays identical regardless of which
             // delivery path the platform chose.
             backInvokedCallback = () -> {
+                // Rename card open → cancel it (top-most when shown).
+                FrameLayout rn = renameOverlay;
+                if (rn != null && rn.getVisibility() == View.VISIBLE) {
+                    hideRenameOverlay();
+                    return;
+                }
                 // 0. Slideshow folder picker open → close it (top-most modal).
                 FrameLayout fp = folderPickerOverlay;
                 if (fp != null && fp.getVisibility() == View.VISIBLE) {
@@ -1875,7 +1933,8 @@ public class LauncherActivity extends Activity {
         aboutQrView = null; aboutQrImage = null; aboutQrCaption = null;
         aboutQrLink = null; aboutQrUrl = null;
         aboutRows[0] = null; aboutRows[1] = null;
-        menuOverlay = null; menuHide = null; menuUninstall = null; menuAppInfo = null; menuMove = null;
+        menuOverlay = null; java.util.Arrays.fill(menuItems, null);
+        renameOverlay = null; renameCard = null; renameField = null;
         keymapOverlay = null; keymapColumn = null; keymapCard = null;
         keymapPickerView = null; keymapPickerTitle = null;
         keymapPickerHsv = null; keymapPickerStrip = null;
@@ -2384,119 +2443,78 @@ public class LauncherActivity extends Activity {
         // updateMenuHighlight just mutates the colour on these existing
         // drawables; the rounded shape is fixed at construction time.
         final int itemRadius = dp(8);
-
-        menuHide = new TextView(this);
-        menuHide.setText(R.string.menu_hide);
-        menuHide.setTextColor(Color.WHITE);
-        menuHide.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13);
-        menuHide.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        menuHide.setGravity(Gravity.CENTER);
-        menuHide.setPadding(dp(20), dp(11), dp(20), dp(11));
-        menuHide.setClickable(true);
-        menuHide.setFocusable(false);
-        menuHide.setContentDescription(getString(R.string.cd_hide_app));
-        android.graphics.drawable.GradientDrawable hBg =
-                new android.graphics.drawable.GradientDrawable();
-        hBg.setCornerRadius(itemRadius);
-        hBg.setColor(Color.TRANSPARENT);
-        menuHide.setBackground(hBg);
-        menuHide.setOnClickListener(v -> {
-            ReorderHost h = menuHost;
-            if (h != null) h.onMenuHide();
-        });
-
-        menuUninstall = new TextView(this);
-        menuUninstall.setText(R.string.menu_uninstall);
-        menuUninstall.setTextColor(0xFFFF6B6B);
-        menuUninstall.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13);
-        menuUninstall.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        menuUninstall.setGravity(Gravity.CENTER);
-        menuUninstall.setPadding(dp(20), dp(11), dp(20), dp(11));
-        menuUninstall.setClickable(true);
-        menuUninstall.setFocusable(false);
-        menuUninstall.setContentDescription(getString(R.string.cd_uninstall_app));
-        android.graphics.drawable.GradientDrawable uBg =
-                new android.graphics.drawable.GradientDrawable();
-        uBg.setCornerRadius(itemRadius);
-        uBg.setColor(Color.TRANSPARENT);
-        menuUninstall.setBackground(uBg);
-        menuUninstall.setOnClickListener(v -> {
-            ReorderHost h = menuHost;
-            if (h != null) h.onMenuUninstall();
-        });
-
-        menuAppInfo = new TextView(this);
-        menuAppInfo.setText(R.string.menu_app_info);
-        menuAppInfo.setTextColor(Color.WHITE);
-        menuAppInfo.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13);
-        menuAppInfo.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        menuAppInfo.setGravity(Gravity.CENTER);
-        menuAppInfo.setPadding(dp(20), dp(11), dp(20), dp(11));
-        menuAppInfo.setClickable(true);
-        menuAppInfo.setFocusable(false);
-        menuAppInfo.setContentDescription(getString(R.string.cd_open_app_info));
-        android.graphics.drawable.GradientDrawable iBg =
-                new android.graphics.drawable.GradientDrawable();
-        iBg.setCornerRadius(itemRadius);
-        iBg.setColor(Color.TRANSPARENT);
-        menuAppInfo.setBackground(iBg);
-        menuAppInfo.setOnClickListener(v -> {
-            ReorderHost h = menuHost;
-            if (h != null) h.onMenuAppInfo();
-        });
-
-        menuMove = new TextView(this);
-        menuMove.setText(R.string.menu_move);
-        menuMove.setTextColor(Color.WHITE);
-        menuMove.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13);
-        menuMove.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        menuMove.setGravity(Gravity.CENTER);
-        menuMove.setPadding(dp(20), dp(11), dp(20), dp(11));
-        menuMove.setClickable(true);
-        menuMove.setFocusable(false);
-        menuMove.setContentDescription(getString(R.string.cd_move_app_position));
-        android.graphics.drawable.GradientDrawable mBg =
-                new android.graphics.drawable.GradientDrawable();
-        mBg.setCornerRadius(itemRadius);
-        mBg.setColor(Color.TRANSPARENT);
-        menuMove.setBackground(mBg);
-        menuMove.setOnClickListener(v -> {
-            ReorderHost h = menuHost;
-            if (h != null) h.onMenuMove();
-        });
+        final TextView[] items = menuItems;
+        items[RecyclingShelfView.MENU_HIDE] = newMenuItem(R.string.menu_hide, R.string.cd_hide_app, itemRadius,
+                v -> { ReorderHost h = menuHost; if (h != null) h.onMenuHide(); });
+        items[RecyclingShelfView.MENU_UNINSTALL] = newMenuItem(R.string.menu_uninstall, R.string.cd_uninstall_app, itemRadius,
+                v -> { ReorderHost h = menuHost; if (h != null) h.onMenuUninstall(); });
+        items[RecyclingShelfView.MENU_UNINSTALL].setTextColor(0xFFFF6B6B);
+        items[RecyclingShelfView.MENU_APP_INFO] = newMenuItem(R.string.menu_app_info, R.string.cd_open_app_info, itemRadius,
+                v -> { ReorderHost h = menuHost; if (h != null) h.onMenuAppInfo(); });
+        items[RecyclingShelfView.MENU_RENAME] = newMenuItem(R.string.menu_rename, R.string.cd_rename_app, itemRadius,
+                v -> { ReorderHost h = menuHost; if (h != null) h.onMenuRename(); });
+        items[RecyclingShelfView.MENU_ICON] = newMenuItem(R.string.menu_change_icon, R.string.cd_change_icon, itemRadius,
+                v -> { ReorderHost h = menuHost; if (h != null) h.onMenuChangeIcon(); });
+        items[RecyclingShelfView.MENU_ICON_RESET] = newMenuItem(R.string.menu_reset_icon, R.string.cd_reset_icon, itemRadius,
+                v -> { ReorderHost h = menuHost; if (h != null) h.onMenuResetIcon(); });
+        items[RecyclingShelfView.MENU_MOVE] = newMenuItem(R.string.menu_move, R.string.cd_move_app_position, itemRadius,
+                v -> { ReorderHost h = menuHost; if (h != null) h.onMenuMove(); });
 
         // Dividers removed — the rounded-pill selection state is enough to
         // separate items visually, and removing them gives a cleaner
-        // menu with no horizontal noise.
-        android.widget.LinearLayout.LayoutParams itemLp =
-                new android.widget.LinearLayout.LayoutParams(dp(140), WRAP);
-        itemLp.bottomMargin = dp(2);
-        android.widget.LinearLayout.LayoutParams itemLp0 =
-                new android.widget.LinearLayout.LayoutParams(dp(140), WRAP);
-        itemLp0.bottomMargin = dp(2);
-        menuCol.addView(menuHide, itemLp0);
-        menuCol.addView(menuUninstall, itemLp);
-        android.widget.LinearLayout.LayoutParams itemLp2 =
-                new android.widget.LinearLayout.LayoutParams(dp(140), WRAP);
-        itemLp2.bottomMargin = dp(2);
-        menuCol.addView(menuAppInfo,   itemLp2);
-        menuCol.addView(menuMove,      new android.widget.LinearLayout.LayoutParams(dp(140), WRAP));
+        // menu with no horizontal noise. Rows go in MENU_ORDER (top→bottom);
+        // dp(150) fits the longest label ("Change icon") on one line.
+        for (int k = 0; k < MENU_ORDER.length; k++) {
+            android.widget.LinearLayout.LayoutParams lp =
+                    new android.widget.LinearLayout.LayoutParams(dp(150), WRAP);
+            if (k < MENU_ORDER.length - 1) lp.bottomMargin = dp(2);
+            menuCol.addView(items[MENU_ORDER[k]], lp);
+        }
 
         menuOverlay.addView(menuCol, new FrameLayout.LayoutParams(WRAP, WRAP));
         r.addView(menuOverlay);
     }
 
+    /** One context-menu row: a rounded-pill TextView whose background colour
+     *  {@link #updateMenuHighlight} mutates in place, so the rounded shape is
+     *  fixed at construction. Not focusable — the D-pad drives the selection
+     *  through the owning {@link ReorderHost}; clicks serve touch / mouse. */
+    private TextView newMenuItem(int textRes, int cdRes, int radius, View.OnClickListener click) {
+        TextView tv = new TextView(this);
+        tv.setText(textRes);
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13);
+        tv.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        tv.setGravity(Gravity.CENTER);
+        tv.setPadding(dp(20), dp(11), dp(20), dp(11));
+        tv.setClickable(true);
+        tv.setFocusable(false);
+        tv.setContentDescription(getString(cdRes));
+        android.graphics.drawable.GradientDrawable bg =
+                new android.graphics.drawable.GradientDrawable();
+        bg.setCornerRadius(radius);
+        bg.setColor(Color.TRANSPARENT);
+        tv.setBackground(bg);
+        tv.setOnClickListener(click);
+        return tv;
+    }
+
     void showContextMenu(View cell) {
-        if (menuOverlay == null || menuHide == null || menuUninstall == null || menuAppInfo == null || menuMove == null) return;
+        TextView[] items = menuItems;
+        if (menuOverlay == null || items[RecyclingShelfView.MENU_MOVE] == null) return;
         // TV-input tiles can't be uninstalled or have an App-info page — hide
-        // those two rows so the menu shows only Hide + Move. Set BEFORE the
-        // measure below so the overlay sizes to the shorter list. menuNavSel
-        // then skips the hidden rows during D-pad navigation.
+        // those two rows. "Reset icon" exists only for an app that has a
+        // custom tile. Set BEFORE the measure below so the overlay sizes to
+        // the shorter list; menuNavSel then skips the hidden rows during
+        // D-pad navigation.
         ReorderHost host = menuHost;
         boolean inputMode = (host != null && host.menuAppIsInput());
+        AppInfo target = (host != null) ? host.menuApp() : null;
+        boolean hasTile = target != null && customTilePkgs.contains(target.packageName);
         int extraVis = inputMode ? View.GONE : View.VISIBLE;
-        menuUninstall.setVisibility(extraVis);
-        menuAppInfo.setVisibility(extraVis);
+        items[RecyclingShelfView.MENU_UNINSTALL].setVisibility(extraVis);
+        items[RecyclingShelfView.MENU_APP_INFO].setVisibility(extraVis);
+        items[RecyclingShelfView.MENU_ICON_RESET].setVisibility(hasTile ? View.VISIBLE : View.GONE);
         cell.getLocationOnScreen(menuCellLoc);
         FrameLayout r = root; if (r == null) return;
         r.getLocationOnScreen(menuRootLoc);
@@ -2612,36 +2630,38 @@ public class LauncherActivity extends Activity {
     }
 
     /** Context-menu rows in top→bottom visual order. {@link #menuNavSel} walks
-     *  these so UP/DOWN navigation and the input-mode row-skipping live in one
-     *  place instead of being duplicated (and drifting) across the two cell
-     *  key handlers. */
-    private static final int[] MENU_ROWS_FULL = {
+     *  these so UP/DOWN navigation and the row-skipping live in one place
+     *  instead of being duplicated (and drifting) across the two cell key
+     *  handlers. Also the order {@link #ensureMenuOverlay} adds the rows in. */
+    private static final int[] MENU_ORDER = {
             RecyclingShelfView.MENU_HIDE, RecyclingShelfView.MENU_UNINSTALL,
-            RecyclingShelfView.MENU_APP_INFO, RecyclingShelfView.MENU_MOVE };
-    /** Input tiles expose only Hide + Move (no Uninstall / App-info). */
-    private static final int[] MENU_ROWS_INPUT = {
-            RecyclingShelfView.MENU_HIDE, RecyclingShelfView.MENU_MOVE };
+            RecyclingShelfView.MENU_APP_INFO, RecyclingShelfView.MENU_RENAME,
+            RecyclingShelfView.MENU_ICON, RecyclingShelfView.MENU_ICON_RESET,
+            RecyclingShelfView.MENU_MOVE };
 
     /** Next menu selection when navigating from {@code cur} by {@code dir}
      *  ({@code -1} = UP toward Hide, {@code +1} = DOWN toward Move), clamped
-     *  at the ends and skipping the Uninstall / App-info rows when the menu is
-     *  acting on a TV input. Input-mode is read LIVE from the active host (not
-     *  a cached flag) so navigation can never run against a stale mode — the
-     *  dragged item is fixed while the menu is open, so this is O(1) and
-     *  stable. For a normal app this reproduces the previous hard-coded chain
-     *  exactly (Hide ↔ Uninstall ↔ App info ↔ Move). */
+     *  at the ends and skipping rows {@link #showContextMenu} hid for this app
+     *  (Uninstall / App info for a TV input, Reset icon without a custom
+     *  tile). Row visibility is the single source of truth, set from the live
+     *  host when the menu opened — the acted-on app is fixed while the menu is
+     *  open, so navigation can never disagree with what is drawn. At most
+     *  {@code MENU_ORDER.length} steps, no allocation. */
     private int menuNavSel(int cur, int dir) {
-        boolean input = (menuHost != null && menuHost.menuAppIsInput());
-        int[] order = input ? MENU_ROWS_INPUT : MENU_ROWS_FULL;
+        TextView[] items = menuItems;
         int idx = 0;
-        for (int i = 0; i < order.length; i++) if (order[i] == cur) { idx = i; break; }
-        idx = Math.max(0, Math.min(order.length - 1, idx + dir));
-        return order[idx];
+        for (int i = 0; i < MENU_ORDER.length; i++) if (MENU_ORDER[i] == cur) { idx = i; break; }
+        for (int i = idx + dir; i >= 0 && i < MENU_ORDER.length; i += dir) {
+            TextView tv = items[MENU_ORDER[i]];
+            if (tv != null && tv.getVisibility() == View.VISIBLE) return MENU_ORDER[i];
+        }
+        return cur;
     }
 
     void updateMenuHighlight() {
         ReorderHost h = menuHost; if (h == null) return;
-        if (menuHide == null || menuUninstall == null || menuAppInfo == null || menuMove == null) return;
+        TextView[] items = menuItems;
+        if (items[RecyclingShelfView.MENU_MOVE] == null) return;
         int sel = h.menuSelection();
         // Bright frosted-white pill for the selected item, mirroring the
         // toolbar buttons & keymap rows. The selected item's text inverts
@@ -2651,14 +2671,14 @@ public class LauncherActivity extends Activity {
         // Each item's background was constructed as a GradientDrawable with
         // a fixed corner radius (see buildLayout) — we mutate the colour on
         // those existing drawables so the rounded shape never changes.
-        setMenuItemBg(menuHide,      sel == RecyclingShelfView.MENU_HIDE      ? hlWhite : Color.TRANSPARENT);
-        setMenuItemBg(menuUninstall, sel == RecyclingShelfView.MENU_UNINSTALL ? hlWhite : Color.TRANSPARENT);
-        setMenuItemBg(menuAppInfo,   sel == RecyclingShelfView.MENU_APP_INFO  ? hlWhite : Color.TRANSPARENT);
-        setMenuItemBg(menuMove,      sel == RecyclingShelfView.MENU_MOVE      ? hlWhite : Color.TRANSPARENT);
-        menuHide     .setTextColor(sel == RecyclingShelfView.MENU_HIDE      ? 0xFF111114 : 0xCCFFFFFF);
-        menuUninstall.setTextColor(sel == RecyclingShelfView.MENU_UNINSTALL ? 0xFFC0202A : 0xCCFF6B6B);
-        menuAppInfo  .setTextColor(sel == RecyclingShelfView.MENU_APP_INFO  ? 0xFF111114 : 0xCCFFFFFF);
-        menuMove     .setTextColor(sel == RecyclingShelfView.MENU_MOVE      ? 0xFF111114 : 0xCCFFFFFF);
+        for (int id = 0; id < items.length; id++) {
+            TextView tv = items[id];
+            if (tv == null) continue;
+            boolean on = (sel == id);
+            setMenuItemBg(tv, on ? hlWhite : Color.TRANSPARENT);
+            if (id == RecyclingShelfView.MENU_UNINSTALL) tv.setTextColor(on ? 0xFFC0202A : 0xCCFF6B6B);
+            else                                         tv.setTextColor(on ? 0xFF111114 : 0xCCFFFFFF);
+        }
     }
 
     /** Updates the colour of an item's existing rounded GradientDrawable
@@ -3113,10 +3133,10 @@ public class LauncherActivity extends Activity {
         // is simply dropped instead of briefly acting on stale data.
         int setAppsGen = 0;
 
-        // MENU_HIDE=3 (top), MENU_UNINSTALL=0, MENU_APP_INFO=1, MENU_MOVE=2 (bottom).
-        // Values are identifiers only — the menu's visual order (Hide, Uninstall,
-        // App Info, Move) is set by the order rows are added in ensureMenuOverlay
-        // and by the explicit UP/DOWN navigation chains, not by these ints.
+        // Values are identifiers (and indexes into menuItems) only — the menu's
+        // visual order (Hide, Uninstall, App Info, Rename, Change icon,
+        // Reset icon, Move) is LauncherActivity.MENU_ORDER, which both
+        // ensureMenuOverlay and menuNavSel follow.
         private static final int MENU_UNINSTALL = 0;
         private static final int MENU_APP_INFO  = 1;
         private static final int MENU_MOVE      = 2;
@@ -3124,6 +3144,12 @@ public class LauncherActivity extends Activity {
         // hides the app from the shelf/drawer (it stays installed and remains
         // available for remote-key shortcuts + the Manage-hidden-apps list).
         private static final int MENU_HIDE      = 3;
+        // v2.3.0 per-app customisation rows. RESET is shown only when the app
+        // has a custom tile (see showContextMenu).
+        private static final int MENU_RENAME     = 4;
+        private static final int MENU_ICON       = 5;
+        private static final int MENU_ICON_RESET = 6;
+        private static final int MENU_COUNT      = 7;
         int menuSelection = MENU_MOVE;
 
         RecyclingShelfView(Context ctx) {
@@ -3175,6 +3201,22 @@ public class LauncherActivity extends Activity {
             menuSelection = MENU_MOVE;
             LauncherActivity.this.updateMenuHighlight();
             enterActiveMove();   // "Move" confirm → start moving (LEFT/RIGHT)
+        }
+        @Override public AppInfo menuApp() {
+            return (dragIndex >= 0 && dragIndex < displayed.size()) ? displayed.get(dragIndex) : null;
+        }
+        @Override public void onMenuRename()     { if (reorderMode) triggerCustomize(MENU_RENAME); }
+        @Override public void onMenuChangeIcon() { if (reorderMode) triggerCustomize(MENU_ICON); }
+        @Override public void onMenuResetIcon()  { if (reorderMode) triggerCustomize(MENU_ICON_RESET); }
+
+        /** Rename / Change icon / Reset icon: dismiss the menu, then hand the
+         *  app and its slot to the activity (v2.3.0). */
+        void triggerCustomize(int row) {
+            int idx = dragIndex;
+            AppInfo app = menuApp();
+            menuSelection = row;
+            exitReorderMode(false);
+            LauncherActivity.this.customizeApp(row, app, false, idx);
         }
 
         void enterReorderMode(int idx) {
@@ -3470,6 +3512,21 @@ public class LauncherActivity extends Activity {
          *  shelf then has to clamp — visible as a brief mis-positioned
          *  ring before snap-back). */
         int lastIndex() { return displayed.isEmpty() ? 0 : displayed.size() - 1; }
+
+        /** Swap in {@code neu} for the displayed entry with the same package
+         *  and re-bind its cell if it is on screen (v2.3.0 rename). Same slot,
+         *  same order, so no relayout, scroll or focus change — the cell just
+         *  re-measures its label because the new instance has no
+         *  {@link AppInfo#displayLabel} memo yet. UI-thread only. */
+        void replaceApp(AppInfo neu) {
+            for (int i = 0, n = displayed.size(); i < n; i++) {
+                if (!displayed.get(i).packageName.equals(neu.packageName)) continue;
+                displayed.set(i, neu);
+                CellView cv = attached.get(i);
+                if (cv != null) bindCell(cv, i);
+                return;
+            }
+        }
 
         /** Re-decode and re-deliver the banner tile for any on-screen cell
          *  bound to {@code pkg}. Called from the loadApps reconcile after a
@@ -4123,7 +4180,8 @@ public class LauncherActivity extends Activity {
                                 if      (menuSelection == MENU_UNINSTALL) triggerUninstall();
                                 else if (menuSelection == MENU_APP_INFO)  triggerAppInfo();
                                 else if (menuSelection == MENU_HIDE)      RecyclingShelfView.this.onMenuHide();
-                                else                                      enterActiveMove();   // MOVE
+                                else if (menuSelection == MENU_MOVE)      enterActiveMove();
+                                else                                      triggerCustomize(menuSelection);
                                 return true;
                             case KeyEvent.KEYCODE_BACK:
                                 exitReorderMode(false); return true;
@@ -4518,6 +4576,22 @@ public class LauncherActivity extends Activity {
             menuSelection = RecyclingShelfView.MENU_MOVE;
             enterActiveMove();   // Move confirm → stage 2 (2-D move)
         }
+        @Override public AppInfo menuApp() {
+            return (dragIndex >= 0 && dragIndex < displayed.size()) ? displayed.get(dragIndex) : null;
+        }
+        @Override public void onMenuRename()     { if (reorderMode) triggerCustomize(RecyclingShelfView.MENU_RENAME); }
+        @Override public void onMenuChangeIcon() { if (reorderMode) triggerCustomize(RecyclingShelfView.MENU_ICON); }
+        @Override public void onMenuResetIcon()  { if (reorderMode) triggerCustomize(RecyclingShelfView.MENU_ICON_RESET); }
+
+        /** Drawer twin of {@code RecyclingShelfView.triggerCustomize}: dismiss
+         *  the menu but keep the drawer open, then hand off to the activity. */
+        void triggerCustomize(int row) {
+            int idx = dragIndex;
+            AppInfo app = menuApp();
+            menuSelection = row;
+            exitReorderMode(false);
+            LauncherActivity.this.customizeApp(row, app, true, idx);
+        }
 
         void setApps(List<AppInfo> apps, int hcIgnored) {
             final int myGen = ++setAppsGen;
@@ -4780,6 +4854,17 @@ public class LauncherActivity extends Activity {
             for (int i = 0; i < attached.size(); i++) {
                 int idx = attached.keyAt(i);
                 if (idx >= 0 && idx < displayed.size()) bindCell(attached.valueAt(i), idx);
+            }
+        }
+
+        /** Drawer counterpart of {@link RecyclingShelfView#replaceApp}. */
+        void replaceApp(AppInfo neu) {
+            for (int i = 0, n = displayed.size(); i < n; i++) {
+                if (!displayed.get(i).packageName.equals(neu.packageName)) continue;
+                displayed.set(i, neu);
+                DrawerCell cv = attached.get(i);
+                if (cv != null) bindCell(cv, i);
+                return;
             }
         }
 
@@ -5300,7 +5385,8 @@ public class LauncherActivity extends Activity {
                                 if      (menuSelection == RecyclingShelfView.MENU_UNINSTALL) triggerUninstall();
                                 else if (menuSelection == RecyclingShelfView.MENU_APP_INFO)  triggerAppInfo();
                                 else if (menuSelection == RecyclingShelfView.MENU_HIDE)      triggerHide();
-                                else                                                          enterActiveMove();
+                                else if (menuSelection == RecyclingShelfView.MENU_MOVE)      enterActiveMove();
+                                else                                                          triggerCustomize(menuSelection);
                                 return true;
                             case KeyEvent.KEYCODE_BACK:
                                 exitReorderMode(false); return true;
@@ -5463,8 +5549,11 @@ public class LauncherActivity extends Activity {
         // once per process — subsequent loadApps() invocations have a
         // populated appList from prior reconciles.
         if (appList.isEmpty()) {
+            final Map<String, String> rn = renames;
             boolean ok = AppListCache.readFile(this, (pkg, lbl, cls) -> {
-                AppInfo a = AppListCache.toAppInfo(pkg, lbl, cls);
+                // The cache holds the app's own label; overlay the user's
+                // rename so the first painted frame already shows it.
+                AppInfo a = AppListCache.toAppInfo(pkg, lbl, cls).withRename(rn);
                 appList.add(a);
                 appByPackage.put(pkg, a);
             });
@@ -5554,6 +5643,11 @@ public class LauncherActivity extends Activity {
                         // reconcile hasn't run yet by the time the user
                         // presses the dead-binding key.
                         pruneKeyMap(freshPkgs);
+                        // Same GC for the v2.3.0 customisations: a rename or a
+                        // custom tile for an uninstalled app is dropped (and
+                        // the tile file deleted) instead of lingering forever.
+                        pruneRenames(freshPkgs);
+                        pruneCustomTiles(freshPkgs);
                         boolean changed = freshFinal.size() != appList.size();
                         if (!changed) {
                             for (int i = 0; i < freshFinal.size(); i++) {
@@ -5567,6 +5661,15 @@ public class LauncherActivity extends Activity {
                             // re-render decodes every visible icon, so any
                             // pending per-package invalidations are subsumed.
                             pendingIconInvalidations.clear();
+                            // queryApps applied the renames snapshot it saw on
+                            // the app executor; a rename committed while that
+                            // scan was in flight would otherwise be undone by
+                            // this replace. Re-apply the current map — a
+                            // no-op (no allocation) unless the two differ.
+                            Map<String, String> rn = renames;
+                            for (int i = 0, n = freshFinal.size(); i < n; i++) {
+                                freshFinal.set(i, freshFinal.get(i).withRename(rn));
+                            }
                             appList.clear(); appList.addAll(freshFinal);
                             // Rebuild the package → AppInfo index alongside
                             // the master list so every consumer that asks
@@ -5886,6 +5989,15 @@ public class LauncherActivity extends Activity {
         // here (on the app executor) so the one binder query never touches
         // the UI thread. See {@link TvInputs}.
         out.addAll(TvInputs.enumerate(this));
+        // Apply user renames here, the one place PM-scanned entries are built,
+        // so the alphabetical order below (and applyStoredOrder's fallback
+        // for apps without a saved slot) sorts by the name the user sees.
+        // One snapshot read; withRename returns the same instance for every
+        // app that isn't renamed, so this allocates nothing for most users.
+        Map<String, String> rn = renames;
+        if (!rn.isEmpty()) {
+            for (int i = 0, n = out.size(); i < n; i++) out.set(i, out.get(i).withRename(rn));
+        }
         Collections.sort(out, (a, b) -> String.CASE_INSENSITIVE_ORDER.compare(a.label, b.label));
         return out;
     }
@@ -6112,6 +6224,134 @@ public class LauncherActivity extends Activity {
                         KeymapStore.serializeHiddenApps(hiddenApps)).apply();
     }
 
+    /** Parse the persisted renames (v2.3.0) once at startup and after a
+     *  restore. A malformed entry is dropped and prefs re-saved so they
+     *  converge to a clean shape — same contract as {@link #loadKeyMap}. */
+    private void loadRenames() {
+        HashMap<String, String> m = new HashMap<>();
+        boolean dropped = Customizations.parseRenames(prefs.getString(KEY_RENAMES, null), m::put);
+        renames = m.isEmpty() ? Collections.emptyMap() : Collections.unmodifiableMap(m);
+        if (dropped) saveRenames();
+    }
+
+    /** Publish {@code next} as the new renames snapshot (the caller hands
+     *  over a fresh map it no longer touches) and persist it. UI thread. */
+    private void publishRenames(HashMap<String, String> next) {
+        renames = next.isEmpty() ? Collections.emptyMap() : Collections.unmodifiableMap(next);
+        saveRenames();
+    }
+
+    private void saveRenames() {
+        prefs.edit().putString(KEY_RENAMES, Customizations.serializeRenames(renames)).apply();
+    }
+
+    /** Parse the persisted custom-tile key set. The comma-separated key-set
+     *  helpers in {@link KeymapStore} are generic, so they are reused as-is. */
+    private void loadCustomTiles() {
+        ArraySet<String> s = new ArraySet<>();
+        KeymapStore.parseHiddenApps(prefs.getString(KEY_CUSTOM_TILES, null), s::add);
+        customTilePkgs = s.isEmpty() ? Collections.emptySet() : Collections.unmodifiableSet(s);
+    }
+
+    /** Publish + persist a new custom-tile key set (same handover contract as
+     *  {@link #publishRenames}). UI thread. */
+    private void publishCustomTiles(ArraySet<String> next) {
+        customTilePkgs = next.isEmpty() ? Collections.emptySet() : Collections.unmodifiableSet(next);
+        prefs.edit().putString(KEY_CUSTOM_TILES, KeymapStore.serializeHiddenApps(next)).apply();
+    }
+
+    /** Drop renames for apps that are no longer installed. Mirrors
+     *  {@link #pruneHiddenApps}, plus an empty-scan guard: an empty result
+     *  is far likelier to be a PackageManager hiccup than a TV with no apps,
+     *  and the user's names would be unrecoverable. Allocates only when
+     *  something is actually pruned. */
+    private void pruneRenames(ArraySet<String> installedPkgs) {
+        Map<String, String> cur = renames;
+        if (cur.isEmpty() || installedPkgs == null || installedPkgs.isEmpty()) return;
+        HashMap<String, String> next = null;
+        for (String k : cur.keySet()) {
+            if (installedPkgs.contains(k)) continue;
+            if (next == null) next = new HashMap<>(cur);
+            next.remove(k);
+        }
+        if (next != null) publishRenames(next);
+    }
+
+    /** Mutable copy of a key set for a copy-on-write update. Not
+     *  {@code new ArraySet<>(Collection)}: that constructor is API 29+ and
+     *  would crash on the Android 8–9 boxes minSdk 26 supports. */
+    private static ArraySet<String> copyKeys(Set<String> src) {
+        ArraySet<String> out = new ArraySet<>(src.size() + 1);
+        out.addAll(src);
+        return out;
+    }
+
+    /** {@link #pruneRenames} for custom tiles; also deletes the orphaned
+     *  image files (off the UI thread). Same empty-scan guard — here it
+     *  protects files the user cannot get back. */
+    private void pruneCustomTiles(ArraySet<String> installedPkgs) {
+        Set<String> cur = customTilePkgs;
+        if (cur.isEmpty() || installedPkgs == null || installedPkgs.isEmpty()) return;
+        ArraySet<String> next = null;
+        for (String k : cur) {
+            if (installedPkgs.contains(k)) continue;
+            if (next == null) next = copyKeys(cur);
+            next.remove(k);
+            deleteTileFileAsync(k);
+        }
+        if (next != null) publishCustomTiles(next);
+    }
+
+    /** Bring every live {@link AppInfo} in line with {@link #renames}. Each
+     *  entry whose shown label changed is replaced — in appList, the
+     *  package index, and in place on both surfaces (its cell re-binds and
+     *  re-measures the label). A TV input draws its label INTO its tile, so
+     *  that tile is re-rendered too. The chip strips (hidden-apps list,
+     *  shortcut picker) hold their own AppInfo lists, so they are marked for
+     *  a rebuild on next open. One pass over appList with no allocation when
+     *  nothing changed. UI thread only. */
+    private void reapplyRenames() {
+        Map<String, String> rn = renames;
+        RecyclingShelfView s = shelf;
+        AppDrawer d = drawer;
+        boolean any = false;
+        for (int i = 0, n = appList.size(); i < n; i++) {
+            AppInfo old = appList.get(i);
+            AppInfo neu = old.withRename(rn);
+            if (neu == old) continue;
+            any = true;
+            appList.set(i, neu);
+            appByPackage.put(neu.packageName, neu);
+            if (s != null) s.replaceApp(neu);
+            if (d != null) d.replaceApp(neu);
+            if (neu.tvInputId != null) refreshTile(neu.packageName);
+        }
+        if (any) {
+            keymapPickerBuiltSize  = -1;
+            keymapHideBuiltSize    = -1;
+            keymapRowsNeedEqualize = true;
+        }
+    }
+
+    /** Store what the user typed in the rename card as {@code key}'s name.
+     *  Blank input, or the app's own name, removes the rename. */
+    private void commitRename(String key, String input) {
+        AppInfo app = findAppByPackage(key);
+        if (app == null) return;                  // uninstalled while the card was open
+        String label = Customizations.normalizeLabel(input);
+        boolean reset = label.isEmpty() || label.equals(app.systemLabel);
+        Map<String, String> cur = renames;
+        if (reset ? !cur.containsKey(key) : label.equals(cur.get(key))) return;   // nothing changed
+        HashMap<String, String> next = new HashMap<>(cur);
+        if (reset) next.remove(key); else next.put(key, label);
+        publishRenames(next);
+        reapplyRenames();
+        // Pin the current arrangement. Apps without a saved slot are placed
+        // alphabetically by the name the user sees, so without this a rename
+        // could move the app on the next start. Renaming never moves an app.
+        saveOrder();
+    }
+
     /** Drop hidden-set entries whose package is no longer installed.
      *  Called from loadApps once the fresh appList is known. O(N + M)
      *  via a single ArraySet pass over fresh package names; the prior
@@ -6315,6 +6555,9 @@ public class LauncherActivity extends Activity {
         }
         // Any key press resets the idle timer (user is active).
         if (event.getAction() == KeyEvent.ACTION_DOWN) scheduleIdleHide();
+        // Rename card (v2.3.0) is the top-most modal when open.
+        FrameLayout rn = renameOverlay;
+        if (rn != null && rn.getVisibility() == View.VISIBLE) return dispatchRenameKey(event);
         FrameLayout ao = aboutOverlay;
         if (ao != null && ao.getVisibility() == View.VISIBLE) {
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
@@ -6446,6 +6689,8 @@ public class LauncherActivity extends Activity {
     private boolean anyOverlayLogicallyOpen() {
         if (keymapOpenedFromSettings) return true;
         if (aboutOpenedFromSettings) return true;
+        FrameLayout rn = renameOverlay;
+        if (rn != null && rn.getVisibility() == View.VISIBLE) return true;
         FrameLayout fp = folderPickerOverlay;
         if (fp != null && fp.getVisibility() == View.VISIBLE) return true;
         FrameLayout ao = aboutOverlay;
@@ -9132,6 +9377,18 @@ public class LauncherActivity extends Activity {
     private Bitmap loadBannerBlocking(AppInfo app) {
         if (app == null) return null;
         final int w = tileWpx, h = bannerHpx, corner = tileCornerPx;
+        // A user-picked tile ("Change icon", v2.3.0) wins over everything,
+        // TV inputs included. The in-memory set check keeps every other app
+        // off the disk; any failure falls through to the normal tile.
+        if (customTilePkgs.contains(app.packageName)) {
+            CustomTiles store = tileStore;
+            Bitmap src = (store != null) ? store.load(app.packageName) : null;
+            if (src != null) {
+                Bitmap tile = IconRenderer.processCustomTile(src, w, h, corner);
+                src.recycle();
+                if (tile != null) return tile;
+            }
+        }
         // TV-input tile: a generated glyph + label (there is no app banner or
         // icon to resolve). Distinct, self-identifying at rest.
         if (app.tvInputId != null) {
@@ -9353,7 +9610,8 @@ public class LauncherActivity extends Activity {
                 hc,
                 prefs.getString(KEY_KEYMAP, ""),
                 prefs.getString(KEY_HIDDEN, ""),
-                clockMode);
+                clockMode,
+                prefs.getString(KEY_RENAMES, ""));
         try (java.io.OutputStream os = getContentResolver().openOutputStream(uri, "w")) {
             if (os == null) { showToast(getString(R.string.toast_backup_failed)); return; }
             os.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -9399,6 +9657,8 @@ public class LauncherActivity extends Activity {
         if (p.has(SettingsBackup.K_APP_ORDER)) ed.putString(KEY_APP_ORDER, p.str(SettingsBackup.K_APP_ORDER));
         if (p.has(SettingsBackup.K_KEY_MAP))   ed.putString(KEY_KEYMAP,    p.str(SettingsBackup.K_KEY_MAP));
         if (p.has(SettingsBackup.K_HIDDEN))    ed.putString(KEY_HIDDEN,    p.str(SettingsBackup.K_HIDDEN));
+        // Absent in pre-2.3.0 backups: the user's current renames are kept.
+        if (p.has(SettingsBackup.K_RENAMES))   ed.putString(KEY_RENAMES,   p.str(SettingsBackup.K_RENAMES));
         int hc = p.intVal(SettingsBackup.K_HOME_COUNT, -1);
         if (hc >= 1) ed.putInt(KEY_HOME_COUNT, hc);
         int cm = p.intVal(SettingsBackup.K_CLOCK_MODE, -1);
@@ -9412,6 +9672,8 @@ public class LauncherActivity extends Activity {
         // Reload in-memory state from the freshly-written prefs.
         loadKeyMap();
         loadHiddenApps();
+        loadRenames();
+        reapplyRenames();   // relabel live entries before the surfaces rebuild below
         homeCount = (hc >= 1) ? hc : -1;   // -1 lets resolveHomeCount re-read / clamp
 
         // Re-order the live app list by the restored order and rebuild both
@@ -9909,6 +10171,312 @@ public class LauncherActivity extends Activity {
         // (wallpaper + clock, nothing else).
     }
 
+    // ── Per-app customisation (v2.3.0): Rename card + Change icon ────────
+
+    /** Entry point for the customisation rows of the context menu, from
+     *  either surface. The menu is already dismissed; {@code idx} is the
+     *  app's slot on the surface it came from, used to put focus back. */
+    void customizeApp(int row, AppInfo app, boolean fromDrawer, int idx) {
+        if (app == null || destroyed) return;
+        if (row == RecyclingShelfView.MENU_RENAME) {
+            showRenameOverlay(app, fromDrawer, idx);
+        } else if (row == RecyclingShelfView.MENU_ICON) {
+            boolean launched = openTilePicker(app);
+            if (fromDrawer) {
+                // The picker pauses us; come back into the drawer on the same
+                // slot, exactly like App info / Uninstall from the drawer.
+                pendingDrawerFocusIdx  = Math.max(0, idx);
+                keepDrawerOpenOnResume = launched;
+            }
+        } else if (row == RecyclingShelfView.MENU_ICON_RESET) {
+            resetCustomTile(app.packageName);
+        }
+    }
+
+    /** Build the rename card on first use. Same glass plate, rim, padding
+     *  and title style as the folder picker / keymap card, holding a single
+     *  framework EditText — typing goes through the device's own keyboard
+     *  (Gboard for TV, the Fire TV keyboard, a USB keyboard), so there is no
+     *  input code of ours to maintain. */
+    private void buildRenameOverlay() {
+        FrameLayout r = root; if (r == null) return;
+        FrameLayout ov = new FrameLayout(this) {
+            @Override public boolean onTouchEvent(MotionEvent ev) {
+                // Tap outside the card cancels, like the folder picker.
+                android.widget.LinearLayout c = renameCard;
+                if (ev.getAction() == MotionEvent.ACTION_DOWN && c != null
+                        && (ev.getX() < c.getX() || ev.getX() > c.getX() + c.getWidth()
+                        ||  ev.getY() < c.getY() || ev.getY() > c.getY() + c.getHeight())) {
+                    hideRenameOverlay();
+                }
+                return true;
+            }
+        };
+        ov.setLayoutParams(new FrameLayout.LayoutParams(MATCH, MATCH));
+        ov.setVisibility(View.GONE);
+        ov.setClickable(true);
+
+        android.widget.LinearLayout card = new android.widget.LinearLayout(this);
+        card.setOrientation(android.widget.LinearLayout.VERTICAL);
+        android.graphics.drawable.GradientDrawable cardBg =
+                new android.graphics.drawable.GradientDrawable();
+        cardBg.setColor(0xF21A1A1F);
+        cardBg.setCornerRadius(dp(14));
+        cardBg.setStroke(1, 0x1AFFFFFF);
+        card.setBackground(cardBg);
+        card.setPadding(dp(8), dp(8), dp(8), dp(8));
+        card.setElevation(dp(10));
+
+        TextView title = new TextView(this);
+        title.setText(R.string.rename_title);
+        title.setTextColor(0xFFEFEFEF);
+        title.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13);
+        title.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        title.setLetterSpacing(0.04f);
+        title.setPadding(dp(4), dp(2), dp(4), dp(8));
+        card.addView(title);
+
+        EditText et = new EditText(this);
+        et.setSingleLine(true);
+        et.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_FLAG_CAP_WORDS
+                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        // NO_FULLSCREEN: ask a docked keyboard (Gboard for TV) to stay docked
+        // instead of switching to its full-screen extract view, so the card
+        // and its hint stay visible. Keyboards that are always full-screen
+        // (Fire TV) ignore it and show their own field — both work.
+        et.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_FULLSCREEN);
+        et.setFilters(new android.text.InputFilter[] {
+                new android.text.InputFilter.LengthFilter(Customizations.MAX_LABEL_LEN) });
+        et.setTextColor(Color.WHITE);
+        et.setHintTextColor(0x66FFFFFF);
+        et.setHighlightColor(0x66FFFFFF);
+        et.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
+        et.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        et.setPadding(dp(12), dp(9), dp(12), dp(9));
+        android.graphics.drawable.GradientDrawable fieldBg =
+                new android.graphics.drawable.GradientDrawable();
+        fieldBg.setColor(0x14FFFFFF);
+        fieldBg.setCornerRadius(dp(9));
+        fieldBg.setStroke(Math.max(1, dp(1)), 0x66FFFFFF);
+        et.setBackground(fieldBg);
+        et.setContentDescription(getString(R.string.cd_rename_field));
+        // The keyboard's Done key, or Enter on a hardware keyboard, commits.
+        // For Enter, TextView reports the DOWN and then the UP edge: commit
+        // once on DOWN and consume both.
+        et.setOnEditorActionListener((v, actionId, ev) -> {
+            boolean enter = ev != null && ev.getKeyCode() == KeyEvent.KEYCODE_ENTER;
+            if (actionId != EditorInfo.IME_ACTION_DONE && !enter) return false;
+            if (ev == null || ev.getAction() == KeyEvent.ACTION_DOWN) commitRenameFromCard();
+            return true;
+        });
+        card.addView(et, new android.widget.LinearLayout.LayoutParams(dp(260), WRAP));
+
+        TextView hint = new TextView(this);
+        hint.setText(R.string.rename_hint);
+        hint.setTextColor(0x80FFFFFF);
+        hint.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11);
+        hint.setPadding(dp(4), dp(8), dp(4), dp(2));
+        card.addView(hint, new android.widget.LinearLayout.LayoutParams(dp(260), WRAP));
+
+        // Top-centre, so a keyboard that slides up from the bottom (Gboard
+        // for TV) never covers the field.
+        FrameLayout.LayoutParams cardLp = new FrameLayout.LayoutParams(WRAP, WRAP);
+        cardLp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        cardLp.topMargin = dp(56);
+        card.setLayoutParams(cardLp);
+        ov.addView(card);
+        r.addView(ov);
+        renameOverlay = ov;
+        renameCard    = card;
+        renameField   = et;
+    }
+
+    /** Open the rename card for {@code app}, pre-filled with its current
+     *  name (selected, so typing replaces it) and with the app's own name as
+     *  the hint shown once the field is cleared. */
+    private void showRenameOverlay(AppInfo app, boolean fromDrawer, int idx) {
+        if (renameOverlay == null) buildRenameOverlay();
+        final FrameLayout ov = renameOverlay;
+        final EditText et = renameField;
+        final android.widget.LinearLayout card = renameCard;
+        if (ov == null || et == null || card == null) return;
+        renameTargetPkg  = app.packageName;
+        renameFromDrawer = fromDrawer;
+        renameFocusIdx   = Math.max(0, idx);
+        et.setHint(app.systemLabel);
+        et.setText(app.label);
+        et.selectAll();
+        ensureOverlayBackdropVisible();
+        ov.setVisibility(View.VISIBLE);
+        ov.bringToFront();
+        card.animate().cancel();
+        card.setAlpha(0f);
+        card.setScaleX(0.94f); card.setScaleY(0.94f);
+        card.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                .setDuration(160).setInterpolator(MENU_IN).withLayer().start();
+        // Posted, not inline: the drawer's exitReorderMode has already posted
+        // its own "refocus the cell + reposition the ring"; this must run
+        // after it, or the cell would take focus back and the ring would sit
+        // over the card. The keyboard is requested one more post later, once
+        // the field is the focused view the IME connects to.
+        et.post(() -> {
+            if (ov.getVisibility() != View.VISIBLE) return;
+            RingView rv = ringView; if (rv != null) rv.setVisibility(View.INVISIBLE);
+            et.requestFocus();
+            et.post(() -> {
+                if (ov.getVisibility() != View.VISIBLE || !et.hasFocus()) return;
+                InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                if (imm != null) imm.showSoftInput(et, 0);
+            });
+        });
+    }
+
+    /** Close the rename card without saving. Focus goes back to the app's
+     *  slot BEFORE the card is hidden: hiding a focused view makes the
+     *  platform pick a new focus itself, and a cell picked that way would
+     *  overwrite its surface's focusedIndex (the same trap
+     *  {@link #hideKeymapOverlay} avoids). */
+    private void hideRenameOverlay() {
+        FrameLayout ov = renameOverlay;
+        if (ov == null || ov.getVisibility() != View.VISIBLE) return;
+        EditText et = renameField;
+        if (et != null) {
+            InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null) imm.hideSoftInputFromWindow(et.getWindowToken(), 0);
+        }
+        AppDrawer d = drawer;
+        RecyclingShelfView s = shelf;
+        if (renameFromDrawer && d != null && d.getVisibility() == View.VISIBLE) {
+            d.requestFocusOnIndex(renameFocusIdx, true);     // clamps internally
+        } else if (s != null && s.getVisibility() == View.VISIBLE && !appList.isEmpty()) {
+            s.requestFocusOnIndex(Math.min(renameFocusIdx, s.lastIndex()), true);
+        } else {
+            View nb = netBtn; if (nb != null) nb.requestFocus();
+        }
+        ov.setVisibility(View.GONE);
+        renameTargetPkg = null;
+        dismissOverlayBackdropIfIdle();
+    }
+
+    private void commitRenameFromCard() {
+        EditText et = renameField;
+        String key = renameTargetPkg;
+        if (et == null || key == null) return;
+        String input = et.getText().toString();
+        hideRenameOverlay();
+        commitRename(key, input);
+    }
+
+    /** Key routing while the rename card is open. The EditText gets every
+     *  key (typing, cursor moves, OK to bring up the keyboard) and BACK
+     *  cancels. The event is always reported consumed, so nothing reaches
+     *  the button shortcuts or the platform's focus search — D-pad UP / DOWN
+     *  can never walk focus out of the card onto the tiles behind it.
+     *  Device-control keys (volume, power, media) still reach the platform
+     *  on both edges, as in the other overlays. */
+    private boolean dispatchRenameKey(KeyEvent event) {
+        int kc = event.getKeyCode();
+        if (kc == KeyEvent.KEYCODE_BACK || kc == KeyEvent.KEYCODE_ESCAPE) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                hideRenameOverlay();
+            }
+            return true;
+        }
+        if (isLetThroughKey(kc)) return super.dispatchKeyEvent(event);
+        EditText et = renameField;
+        if (et != null && !et.hasFocus()) et.requestFocus();
+        super.dispatchKeyEvent(event);
+        return true;
+    }
+
+    /** Open the system image picker for "Change icon". Tries the Storage
+     *  Access Framework first (as Set wallpaper does), then
+     *  {@code ACTION_GET_CONTENT}, which TV file managers handle on ROMs that
+     *  ship without a documents UI. The fallback is fine here because the
+     *  image is copied straight away — no persistable grant is needed. */
+    @SuppressWarnings("deprecation")
+    private boolean openTilePicker(AppInfo app) {
+        Intent[] tries = {
+                new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                        .addCategory(Intent.CATEGORY_OPENABLE).setType("image/*"),
+                new Intent(Intent.ACTION_GET_CONTENT)
+                        .addCategory(Intent.CATEGORY_OPENABLE).setType("image/*") };
+        for (Intent i : tries) {
+            try {
+                startActivityForResult(i, REQ_PICK_TILE);
+                pendingTilePkg = app.packageName;
+                return true;
+            } catch (Exception ignored) { /* no handler — try the next */ }
+        }
+        showToast(getString(R.string.toast_no_file_picker));
+        return false;
+    }
+
+    /** Copy the picked image into {@link #tileStore} on the icon executor,
+     *  then switch the app's tile over on the UI thread. */
+    private void saveCustomTileAsync(String key, Uri uri) {
+        final CustomTiles store = tileStore;
+        final android.content.ContentResolver cr = getContentResolver();
+        ThreadPoolExecutor ex = iconExecutor;
+        if (store == null || ex == null) return;
+        try {
+            ex.execute(() -> {
+                if (destroyed) return;
+                final boolean ok = store.save(cr, uri, key);
+                runOnUiThread(() -> {
+                    if (destroyed) return;
+                    if (!ok) { showToast(getString(R.string.toast_tile_failed)); return; }
+                    Set<String> cur = customTilePkgs;
+                    if (!cur.contains(key)) {
+                        ArraySet<String> next = copyKeys(cur);
+                        next.add(key);
+                        publishCustomTiles(next);
+                    }
+                    // Also covers replacing an existing custom image: same
+                    // key, new file, so the cached tile must be re-rendered.
+                    refreshTile(key);
+                });
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            showToast(getString(R.string.toast_tile_failed));
+        }
+    }
+
+    /** "Reset icon": forget the custom tile and show the app's own again. The
+     *  set is published before the re-render so the decode skips the file. */
+    private void resetCustomTile(String key) {
+        Set<String> cur = customTilePkgs;
+        if (!cur.contains(key)) return;
+        ArraySet<String> next = copyKeys(cur);
+        next.remove(key);
+        publishCustomTiles(next);
+        refreshTile(key);
+        deleteTileFileAsync(key);
+    }
+
+    /** Drop {@code key}'s cached banner tile and re-decode it on every cell
+     *  showing it — the same steps the reconcile takes after a package
+     *  update. UI thread only. */
+    private void refreshTile(String key) {
+        LruCache<String, Bitmap> bc = bannerCache;
+        if (bc != null) bc.remove(key);
+        bannerInflight.remove(key);
+        RecyclingShelfView s = shelf; if (s != null) s.refreshBanner(key);
+        AppDrawer d = drawer;         if (d != null) d.refreshBanner(key);
+    }
+
+    /** Delete a tile file off the UI thread. Best-effort: a file that
+     *  survives is never read, because only keys in {@link #customTilePkgs}
+     *  are loaded. */
+    private void deleteTileFileAsync(String key) {
+        final CustomTiles store = tileStore;
+        ThreadPoolExecutor ex = iconExecutor;
+        if (store == null || ex == null) return;
+        try { ex.execute(() -> store.delete(key)); }
+        catch (java.util.concurrent.RejectedExecutionException ignored) { /* see javadoc */ }
+    }
+
     // ── Slideshow folder picker overlay ──────────────────────────────────
 
     /** Show the custom folder picker for the scanned {@code folders}. */
@@ -10199,6 +10767,13 @@ public class LauncherActivity extends Activity {
     @Override @SuppressWarnings("deprecation")
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
+        if (req == REQ_PICK_TILE) {
+            String key = pendingTilePkg;
+            pendingTilePkg = null;
+            Uri uri = (res == RESULT_OK && data != null) ? data.getData() : null;
+            if (key != null && uri != null) saveCustomTileAsync(key, uri);
+            return;
+        }
         if (req == REQ_BACKUP_EXPORT && res == RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri != null) writeBackup(uri);
@@ -10357,6 +10932,9 @@ public class LauncherActivity extends Activity {
         // icon-load executor tasks can read from / write to it. Owns
         // its own write executor; shut down in onDestroy().
         iconDiskCache = new IconDiskCache(this);
+        // User-picked tiles ("Change icon"). Constructing it touches no disk;
+        // every read / write runs later on the icon executor.
+        tileStore = new CustomTiles(this);
         // The in-memory icon cache. Pure LRU, no create() fallback —
         // the disk lookup is performed inside {@link #loadIconBlocking}
         // on the iconExecutor's worker thread. Earlier drafts wired the
